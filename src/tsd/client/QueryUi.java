@@ -20,18 +20,30 @@ package tsd.client;
 
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.HashMap;
 
 import com.google.gwt.core.client.EntryPoint;
+import com.google.gwt.dom.client.Style;
 import com.google.gwt.event.dom.client.ClickEvent;
 import com.google.gwt.event.dom.client.ClickHandler;
 import com.google.gwt.event.dom.client.DomEvent;
 import com.google.gwt.event.dom.client.ErrorEvent;
 import com.google.gwt.event.dom.client.ErrorHandler;
+import com.google.gwt.event.dom.client.LoadEvent;
+import com.google.gwt.event.dom.client.LoadHandler;
+import com.google.gwt.event.dom.client.MouseDownEvent;
+import com.google.gwt.event.dom.client.MouseDownHandler;
+import com.google.gwt.event.dom.client.MouseEvent;
+import com.google.gwt.event.dom.client.MouseMoveEvent;
+import com.google.gwt.event.dom.client.MouseMoveHandler;
+import com.google.gwt.event.dom.client.MouseUpEvent;
+import com.google.gwt.event.dom.client.MouseUpHandler;
 import com.google.gwt.event.logical.shared.BeforeSelectionEvent;
 import com.google.gwt.event.logical.shared.BeforeSelectionHandler;
 import com.google.gwt.event.logical.shared.ValueChangeEvent;
 import com.google.gwt.event.logical.shared.ValueChangeHandler;
 import com.google.gwt.event.shared.EventHandler;
+import com.google.gwt.event.shared.HandlerRegistration;
 import com.google.gwt.http.client.Request;
 import com.google.gwt.http.client.RequestBuilder;
 import com.google.gwt.http.client.RequestCallback;
@@ -46,8 +58,11 @@ import com.google.gwt.json.client.JSONParser;
 import com.google.gwt.json.client.JSONString;
 import com.google.gwt.json.client.JSONValue;
 import com.google.gwt.user.client.Element;
+import com.google.gwt.user.client.History;
+import com.google.gwt.user.client.HistoryListener;
 import com.google.gwt.user.client.Timer;
 import com.google.gwt.user.client.Window;
+import com.google.gwt.user.client.ui.AbsolutePanel;
 import com.google.gwt.user.client.ui.Anchor;
 import com.google.gwt.user.client.ui.CheckBox;
 import com.google.gwt.user.client.ui.DecoratedTabPanel;
@@ -70,7 +85,7 @@ import com.google.gwt.user.client.ui.Widget;
  * Root class for the 'query UI'.
  * Manages the entire UI, forms to query the TSDB and other misc panels.
  */
-public class QueryUi implements EntryPoint {
+public class QueryUi implements EntryPoint, HistoryListener {
   // Some URLs we use to fetch data from the TSD.
   private static final String AGGREGATORS_URL = "/aggregators";
   private static final String LOGS_URL = "/logs?json";
@@ -84,7 +99,7 @@ public class QueryUi implements EntryPoint {
 
   private final DateTimeBox start_datebox = new DateTimeBox();
   private final DateTimeBox end_datebox = new DateTimeBox();
-  private final CheckBox autoreoload = new CheckBox("Autoreload");
+  private final CheckBox autoreload = new CheckBox("Autoreload");
   private final ValidatedTextBox autoreoload_interval = new ValidatedTextBox();
   private Timer autoreoload_timer;
 
@@ -103,6 +118,9 @@ public class QueryUi implements EntryPoint {
   private final CheckBox keybox = new CheckBox("Box");
   private final CheckBox nokey = new CheckBox("No key (overrides others)");
 
+  // Styling options.
+  private final CheckBox smooth = new CheckBox();
+
   /**
    * Handles every change to the query form and gets a new graph.
    * Whenever the user changes one of the parameters of the graph, we want
@@ -114,12 +132,52 @@ public class QueryUi implements EntryPoint {
     }
   };
 
+  final MetricForm.MetricChangeHandler metric_change_handler =
+    new MetricForm.MetricChangeHandler() {
+      public void onMetricChange(final MetricForm metric) {
+        final int index = metrics.getWidgetIndex(metric);
+        metrics.getTabBar().setTabText(index, getTabTitle(metric));
+      }
+      private String getTabTitle(final MetricForm metric) {
+        final String metrictext = metric.getMetric();
+        final int last_period = metrictext.lastIndexOf('.');
+        if (last_period < 0) {
+          return metrictext;
+        }
+        return metrictext.substring(last_period + 1);
+      }
+    };
+
+  final EventsHandler updatey2range = new EventsHandler() {
+      protected <H extends EventHandler> void onEvent(final DomEvent<H> event) {
+        for (final Widget metric : metrics) {
+          if (!(metric instanceof MetricForm)) {
+            continue;
+          }
+          if (((MetricForm) metric).x1y2().getValue()) {
+            y2range.setEnabled(true);
+            y2log.setEnabled(true);
+            y2label.setEnabled(true);
+            y2format.setEnabled(true);
+            return;
+          }
+        }
+        y2range.setEnabled(false);
+        y2log.setEnabled(false);
+        y2label.setEnabled(false);
+        y2format.setEnabled(false);
+      }
+    };
+
   /** List of known aggregation functions.  Fetched once from the server. */
   private final ArrayList<String> aggregators = new ArrayList<String>();
 
   private final DecoratedTabPanel metrics = new DecoratedTabPanel();
 
+  /** Panel to place generated graphs and a box for zoom highlighting. */
+  private final AbsolutePanel graphbox = new AbsolutePanel();
   private final Image graph = new Image();
+  private final ZoomBox zoom_box = new ZoomBox();
   private final Label graphstatus = new Label();
   /** Remember the last URI requested to avoid requesting twice the same. */
   private String lastgraphuri;
@@ -152,6 +210,8 @@ public class QueryUi implements EntryPoint {
           aggregators.add(aggs.get(i).isString().stringValue());
         }
         ((MetricForm) metrics.getWidget(0)).setAggregators(aggregators);
+        refreshFromQueryString();
+        refreshGraph();
       }
     });
 
@@ -194,6 +254,7 @@ public class QueryUi implements EntryPoint {
     horizontalkey.addClickHandler(refreshgraph);
     keybox.addClickHandler(refreshgraph);
     nokey.addClickHandler(refreshgraph);
+    smooth.addClickHandler(refreshgraph);
 
     yrange.setValidationRegexp("^("                            // Nothing or
                                + "|\\[([-+.0-9eE]+|\\*)?"      // "[start
@@ -244,13 +305,14 @@ public class QueryUi implements EntryPoint {
         }
       });
       hbox.add(now);
-      hbox.add(autoreoload);
+      hbox.add(autoreload);
       hbox.setWidth("100%");
       table.setWidget(0, 1, hbox);
     }
-    autoreoload.addClickHandler(new ClickHandler() {
-      public void onClick(final ClickEvent event) {
-        if (autoreoload.getValue()) {
+    autoreload.addValueChangeHandler(new ValueChangeHandler<Boolean>() {
+      @Override
+      public void onValueChange(final ValueChangeEvent<Boolean> event) {
+        if (autoreload.getValue()) {
           final HorizontalPanel hbox = new HorizontalPanel();
           hbox.setWidth("100%");
           hbox.add(new InlineLabel("Every:"));
@@ -281,45 +343,7 @@ public class QueryUi implements EntryPoint {
       table.setWidget(0, 3, hbox);
     }
     {
-      final MetricForm.MetricChangeHandler metric_change_handler =
-        new MetricForm.MetricChangeHandler() {
-          public void onMetricChange(final MetricForm metric) {
-            final int index = metrics.getWidgetIndex(metric);
-            metrics.getTabBar().setTabText(index, getTabTitle(metric));
-          }
-          private String getTabTitle(final MetricForm metric) {
-            final String metrictext = metric.getMetric();
-            final int last_period = metrictext.lastIndexOf('.');
-            if (last_period < 0) {
-              return metrictext;
-            }
-            return metrictext.substring(last_period + 1);
-          }
-        };
-      final EventsHandler updatey2range = new EventsHandler() {
-        protected <H extends EventHandler> void onEvent(final DomEvent<H> event) {
-          for (final Widget metric : metrics) {
-            if (!(metric instanceof MetricForm)) {
-              continue;
-            }
-            if (((MetricForm) metric).x1y2().getValue()) {
-              y2range.setEnabled(true);
-              y2log.setEnabled(true);
-              y2label.setEnabled(true);
-              y2format.setEnabled(true);
-              return;
-            }
-          }
-          y2range.setEnabled(false);
-          y2log.setEnabled(false);
-          y2label.setEnabled(false);
-          y2format.setEnabled(false);
-        }
-      };
-      final MetricForm metric = new MetricForm(refreshgraph);
-      metric.x1y2().addClickHandler(updatey2range);
-      metric.setMetricChangeHandler(metric_change_handler);
-      metrics.add(metric, "metric 1");
+      addMetricForm("metric 1", 0);
       metrics.selectTab(0);
       metrics.add(new InlineLabel("Loading..."), "+");
       metrics.addBeforeSelectionHandler(new BeforeSelectionHandler<Integer>() {
@@ -328,11 +352,7 @@ public class QueryUi implements EntryPoint {
           final int nitems = metrics.getWidgetCount();
           if (item == nitems - 1) {  // Last item: the "+" was clicked.
             event.cancel();
-            final MetricForm metric = new MetricForm(refreshgraph);
-            metric.x1y2().addClickHandler(updatey2range);
-            metric.setMetricChangeHandler(metric_change_handler);
-            metric.setAggregators(aggregators);
-            metrics.insert(metric, "metric " + nitems, item);
+            final MetricForm metric = addMetricForm("metric " + nitems, item);
             metrics.selectTab(item);
             metric.setFocus(true);
           }
@@ -345,6 +365,7 @@ public class QueryUi implements EntryPoint {
     final DecoratedTabPanel optpanel = new DecoratedTabPanel();
     optpanel.add(makeAxesPanel(), "Axes");
     optpanel.add(makeKeyPanel(), "Key");
+    optpanel.add(makeStylePanel(), "Style");
     optpanel.selectTab(0);
     table.setWidget(1, 3, optpanel);
 
@@ -355,13 +376,27 @@ public class QueryUi implements EntryPoint {
     {
       final VerticalPanel graphvbox = new VerticalPanel();
       graphvbox.add(graphstatus);
+
       graph.setVisible(false);
-      graphvbox.add(graph);
+
+      // Put the graph image element and the zoombox elements inside the absolute panel
+      graphbox.add(graph, 0, 0);
+      zoom_box.setVisible(false);
+      graphbox.add(zoom_box, 0, 0);
+
+      graphvbox.add(graphbox);
       graph.addErrorHandler(new ErrorHandler() {
         public void onError(final ErrorEvent event) {
           graphstatus.setText("Oops, failed to load the graph.");
         }
       });
+      graph.addLoadHandler(new LoadHandler() {
+        public void onLoad(final LoadEvent event) {
+          graphbox.setWidth(graph.getWidth() + "px");
+          graphbox.setHeight(graph.getHeight() + "px");
+        }
+      });
+
       graphpanel.add(graphvbox);
     }
     final DecoratedTabPanel mainpanel = new DecoratedTabPanel();
@@ -391,6 +426,22 @@ public class QueryUi implements EntryPoint {
     RootPanel.get("queryuimain").add(root);
     // Must be done at the end, once all the widgets are attached.
     ensureSameWidgetSize(optpanel);
+
+    History.addHistoryListener(this);
+  }
+
+  @Override
+  public void onHistoryChanged(String historyToken) {
+    refreshFromQueryString();
+    refreshGraph();
+  }
+
+  /** Additional styling options.  */
+  private Grid makeStylePanel() {
+    final Grid grid = new Grid(5, 3);
+    grid.setText(0, 1, "Smooth");
+    grid.setWidget(0, 2, smooth);
+    return grid;
   }
 
   /**
@@ -418,6 +469,18 @@ public class QueryUi implements EntryPoint {
     return grid;
   }
 
+  private MetricForm addMetricForm(final String label, final int item) {
+    final MetricForm metric = new MetricForm(refreshgraph);
+    metric.x1y2().addClickHandler(updatey2range);
+    metric.setMetricChangeHandler(metric_change_handler);
+    metric.setAggregators(aggregators);
+    metrics.insert(metric, label, item);
+    return metric;
+  }
+
+  private final HashMap<String, RadioButton> keypos_map =
+    new HashMap<String, RadioButton>(17);
+
   /**
    * Small helper to build a radio button used to change the position of the
    * key of the graph.
@@ -433,6 +496,7 @@ public class QueryUi implements EntryPoint {
     });
     rb.addClickHandler(refreshgraph);
     grid.setWidget(row, col, rb);
+    keypos_map.put(pos, rb);
     return rb;
   }
 
@@ -577,12 +641,12 @@ public class QueryUi implements EntryPoint {
   private void addLabels(final StringBuilder url) {
     final String ylabel = this.ylabel.getText();
     if (!ylabel.isEmpty()) {
-      url.append("&ylabel=").append(URL.encodeComponent(ylabel));
+      url.append("&ylabel=").append(ylabel);
     }
     if (y2label.isEnabled()) {
       final String y2label = this.y2label.getText();
       if (!y2label.isEmpty()) {
-        url.append("&y2label=").append(URL.encodeComponent(y2label));
+        url.append("&y2label=").append(y2label);
       }
     }
   }
@@ -590,12 +654,12 @@ public class QueryUi implements EntryPoint {
   private void addFormats(final StringBuilder url) {
     final String yformat = this.yformat.getText();
     if (!yformat.isEmpty()) {
-      url.append("&yformat=").append(URL.encodeComponent(yformat));
+      url.append("&yformat=").append(yformat);
     }
     if (y2format.isEnabled()) {
       final String y2format = this.y2format.getText();
       if (!y2format.isEmpty()) {
-        url.append("&y2format=").append(URL.encodeComponent(y2format));
+        url.append("&y2format=").append(y2format);
       }
     }
   }
@@ -622,6 +686,115 @@ public class QueryUi implements EntryPoint {
     }
   }
 
+  /**
+   * Maybe sets the text of a {@link TextBox} from a query string parameter.
+   * @param qs A parsed query string.
+   * @param key Name of the query string parameter.
+   * If this parameter wasn't passed, the {@link TextBox} will be emptied.
+   * @param tb The {@link TextBox} to change.
+   */
+  private static void maybeSetTextbox(final QueryString qs,
+                                      final String key,
+                                      final TextBox tb) {
+    final ArrayList<String> values = qs.get(key);
+    if (values == null) {
+      tb.setText("");
+      return;
+    }
+    tb.setText(values.get(0));
+  }
+
+  /**
+   * Sets the text of a {@link TextBox} from a query string parameter.
+   * @param qs A parsed query string.
+   * @param key Name of the query string parameter.
+   * @param tb The {@link TextBox} to change.
+   */
+  private static void setTextbox(final QueryString qs,
+                                 final String key,
+                                 final TextBox tb) {
+    final ArrayList<String> values = qs.get(key);
+    if (values != null) {
+      tb.setText(values.get(0));
+    }
+  }
+
+  private static QueryString getQueryString(final String qs) {
+    return qs.isEmpty() ? new QueryString() : QueryString.decode(qs);
+  }
+
+  private void refreshFromQueryString() {
+    final QueryString qs = getQueryString(History.getToken());
+
+    maybeSetTextbox(qs, "start", start_datebox.getTextBox());
+    maybeSetTextbox(qs, "end", end_datebox.getTextBox());
+    setTextbox(qs, "wxh", wxh);
+    autoreload.setValue(qs.containsKey("autoreload"), true);
+    maybeSetTextbox(qs, "autoreload", autoreoload_interval);
+
+    final ArrayList<String> newmetrics = qs.get("m");
+    if (newmetrics == null) {  // Clear all metric forms.
+      final int toremove = metrics.getWidgetCount() - 1;
+      addMetricForm("metric 1", 0);
+      metrics.selectTab(0);
+      for (int i = 0; i < toremove; i++) {
+        metrics.remove(1);
+      }
+      return;
+    }
+    final int n = newmetrics.size();  // We want this many metrics.
+    ArrayList<String> options = qs.get("o");
+    if (options == null) {
+      options = new ArrayList<String>(n);
+    }
+    for (int i = options.size(); i < n; i++) {  // Make both arrays equal size.
+      options.add("");  // Add missing o's.
+    }
+
+    for (int i = 0; i < newmetrics.size(); ++i) {
+      if (i == metrics.getWidgetCount() - 1) {
+        addMetricForm("", i);
+      }
+
+      final MetricForm metric = (MetricForm) metrics.getWidget(i);
+      metric.updateFromQueryString(newmetrics.get(i), options.get(i));
+    }
+    // Remove extra metric forms.
+    final int m = metrics.getWidgetCount() - 1; // We have this many metrics.
+    int showing = metrics.getTabBar().getSelectedTab();  // Currently selected.
+    for (int i = m - 1; i >= n; i--) {
+      if (showing == i) {  // If we're about to remove the currently selected,
+        metrics.selectTab(--showing);  // fix focus to not wind up nowhere.
+      }
+      metrics.remove(i);
+    }
+    updatey2range.onEvent(null);
+
+    maybeSetTextbox(qs, "ylabel", ylabel);
+    maybeSetTextbox(qs, "y2label", y2label);
+    maybeSetTextbox(qs, "yformat", yformat);
+    maybeSetTextbox(qs, "y2format", y2format);
+    maybeSetTextbox(qs, "yrange", yrange);
+    maybeSetTextbox(qs, "y2range", y2range);
+    ylog.setValue(qs.containsKey("ylog"));
+    y2log.setValue(qs.containsKey("y2log"));
+
+    if (qs.containsKey("key")) {
+      final String key = qs.getFirst("key");
+      keybox.setValue(key.contains(" box"));
+      horizontalkey.setValue(key.contains(" horiz"));
+      keypos = key.replaceAll(" (box|horiz\\w*)", "");
+      keypos_map.get(keypos).setChecked(true);
+    } else {
+      keybox.setValue(false);
+      horizontalkey.setValue(false);
+      keypos_map.get("top right").setChecked(true);
+      keypos = "";
+    }
+    nokey.setValue(qs.containsKey("nokey"));
+    smooth.setValue(qs.containsKey("smooth"));
+  }
+
   private void refreshGraph() {
     final Date start = start_datebox.getValue();
     if (start == null) {
@@ -629,7 +802,7 @@ public class QueryUi implements EntryPoint {
       return;
     }
     final Date end = end_datebox.getValue();
-    if (end != null && !autoreoload.getValue()) {
+    if (end != null && !autoreload.getValue()) {
       if (end.getTime() <= start.getTime()) {
         end_datebox.addStyleName("dateBoxFormatError");
         graphstatus.setText("End time must be after start time!");
@@ -638,7 +811,7 @@ public class QueryUi implements EntryPoint {
     }
     final StringBuilder url = new StringBuilder();
     url.append("/q?start=").append(FULLDATE.format(start));
-    if (end != null && !autoreoload.getValue()) {
+    if (end != null && !autoreload.getValue()) {
       url.append("&end=").append(FULLDATE.format(end));
     } else {
       // If there's no end-time, the graph may change while the URL remains
@@ -672,7 +845,11 @@ public class QueryUi implements EntryPoint {
       }
     }
     url.append("&wxh=").append(wxh.getText());
-    final String uri = url.toString();
+    if (smooth.getValue()) {
+      url.append("&smooth=csplines");
+    }
+    final String unencodedUri = url.toString();
+    final String uri = URL.encode(unencodedUri);
     if (uri.equals(lastgraphuri)) {
       return;  // Don't re-request the same graph.
     } else if (pending_requests++ > 0) {
@@ -695,6 +872,16 @@ public class QueryUi implements EntryPoint {
           graphstatus.setText("Please correct the error above.");
         } else {
           clearError();
+
+          String history = unencodedUri.substring(3)      // Remove "/q?".
+            .replaceFirst("ignore=[^&]*&", "");  // Unnecessary cruft.
+          if (autoreload.getValue()) {
+            history += "&autoreload=" + autoreoload_interval.getText();
+          }
+          if (!history.equals(History.getToken())) {
+            History.newItem(history, false);
+          }
+
           final JSONValue nplotted = result.get("plotted");
           final JSONValue cachehit = result.get("cachehit");
           if (cachehit != null) {
@@ -703,6 +890,7 @@ public class QueryUi implements EntryPoint {
           if (nplotted != null && nplotted.isNumber().doubleValue() > 0) {
             graph.setUrl(uri + "&png");
             graph.setVisible(true);
+
             msg += result.get("points").isNumber() + " points retrieved, "
               + nplotted + " points plotted";
           } else {
@@ -743,14 +931,14 @@ public class QueryUi implements EntryPoint {
             }
           }
         }
-        if (autoreoload.getValue()) {
+        if (autoreload.getValue()) {
           final int reload_in = Integer.parseInt(autoreoload_interval.getValue());
           if (reload_in >= 5) {
             autoreoload_timer = new Timer() {
               public void run() {
                 // Verify that we still want auto reload and that the graph
                 // hasn't been updated in the mean time.
-                if (autoreoload.getValue() && lastgraphuri == uri) {
+                if (autoreload.getValue() && lastgraphuri == uri) {
                   // Force refreshGraph to believe that we want a new graph.
                   lastgraphuri = "";
                   refreshGraph();
@@ -860,6 +1048,194 @@ public class QueryUi implements EntryPoint {
   static void setTextAlignCenter(final Element element) {
     element.getStyle().setProperty("textAlign", "center");
   }
+
+  /** Zoom box and associated event handlers.  */
+  private final class ZoomBox extends HTML
+    implements MouseUpHandler, MouseMoveHandler, MouseDownHandler {
+
+    /** "Fudge factor" to account for the axes present on the image. */
+    private static final int OFFSET_WITH_AXIS = 45;
+    private static final int OFFSET_WITHOUT_AXIS = 15;
+
+    private boolean zoom_selection_active = false;
+    /** Rectangle of the selection.  */
+    private int start_x;
+    private int end_x;
+    private int start_y;
+    private int end_y;
+
+    private HandlerRegistration graph_move_handler;
+    private HandlerRegistration box_move_handler;
+
+    ZoomBox() {
+      // Set ourselves up as the event handler for all mouse-draggable events.
+      graph.addMouseDownHandler(this);
+      graph.addMouseUpHandler(this);
+
+      // Also add the handlers on the actual zoom highlight box (this is in
+      // case the cursor gets on the zoombox, so that it keeps responding
+      // correctly).
+      super.addMouseUpHandler(this);
+
+      final Style style = super.getElement().getStyle();
+      style.setProperty("background", "red");
+      style.setProperty("filter", "alpha(opacity=50)");
+      style.setProperty("opacity", "0.4");
+      // Needed to make this object focusable.
+      super.getElement().setAttribute("tabindex", "-1");
+    }
+
+    @Override
+    public void onMouseDown(final MouseDownEvent event) {
+      event.preventDefault();
+
+      // Check if the zoom selection is active, if so, it's possible that the
+      // mouse left the browser mid-selection and got stuck enabled even
+      // though the mouse isn't still pressed. If that's the case, do a similar
+      // operation to the onMouseUp event.
+      if (zoom_selection_active) {
+        endSelection(event);
+        return;
+      }
+
+      final Element image = graph.getElement();
+      zoom_selection_active = true;
+      start_x = event.getRelativeX(image);
+      start_y = event.getRelativeY(image);
+      end_x = 0;
+      end_y = 0;
+
+      graphbox.setWidgetPosition(this, start_x, start_y);
+      super.setWidth("0px");
+      super.setHeight("0px");
+      super.setVisible(true);
+      // Workaround to steal the focus from whatever had it previously,
+      // which may cause the graph to reload as a side effect.
+      super.getElement().focus();
+
+      graph_move_handler = graph.addMouseMoveHandler(this);
+      box_move_handler = super.addMouseMoveHandler(this);
+    }
+
+    @Override
+    public void onMouseMove(final MouseMoveEvent event) {
+      event.preventDefault();
+
+      final int x = event.getRelativeX(graph.getElement());
+      final int y = event.getRelativeY(graph.getElement());
+      int left;
+      int top;
+      int width;
+      int height;
+
+      // Figure out the top, left, height, and width of the box based
+      // on current cursor location.
+      if (x < start_x) {
+        left = x;
+        width = start_x - x;
+      } else {
+        left = start_x;
+        width = x - start_x;
+      }
+      if (y < start_y) {
+        top = y;
+        height = start_y - y;
+      } else {
+        top = start_y;
+        height = y - start_y;
+      }
+
+      // Resize / move the box as needed based on cursor location.
+      super.setVisible(false);
+      graphbox.setWidgetPosition(this, left, top);
+      super.setWidth(width + "px");
+      super.setHeight(height + "px");
+      super.setVisible(true);
+    }
+
+    @Override
+    public void onMouseUp(final MouseUpEvent event) {
+      if (zoom_selection_active) {
+        endSelection(event);
+      }
+    }
+
+    /**
+     * Perform operations for when a user completes their selection.
+     * This involves removing the highlight box and kicking off the
+     * zoom in operation.
+     * @param event The event that triggered the end of the selection.
+     */
+    private <H extends EventHandler> void endSelection(final MouseEvent<H> event) {
+      zoom_selection_active = false;
+
+      // Stop tracking cursor movements to improve performance.
+      graph_move_handler.removeHandler();
+      graph_move_handler = null;
+      box_move_handler.removeHandler();
+      box_move_handler = null;
+
+      final Element image = graph.getElement();
+      end_x = event.getRelativeX(image);
+      end_y = event.getRelativeY(image);
+
+      // Hide the zoom box
+      super.setVisible(false);
+      super.setWidth("0px");
+      super.setHeight("0px");
+
+      // Calculate the true start/end points of the zoom area selected by
+      // mouse. If the mouse was dragged left on the graph before being
+      // let up, then start_x is the right-most edge of the zoomable area.
+      // If the mouse was dragged right on the graph before being let up,
+      // then start_x is the left-most edge of the zoomable area.
+      if (start_x < end_x) {
+        start_x = start_x - OFFSET_WITH_AXIS;
+        end_x = end_x - OFFSET_WITH_AXIS;
+      } else {
+        final int saved_start = start_x;
+        start_x = end_x - OFFSET_WITH_AXIS;
+        end_x = saved_start - OFFSET_WITH_AXIS;
+      }
+      int actual_width = graph.getWidth() - OFFSET_WITH_AXIS;
+      if (y2range.isEnabled()) {  // If we have a second Y axis.
+        actual_width -= OFFSET_WITH_AXIS;
+      } else {
+        actual_width -= OFFSET_WITHOUT_AXIS;
+      }
+
+      // Prevent division by zero if image is pathologically small.
+      // or: Prevent changing anything if the distance the cursor traveled was
+      // too small (as happens during a simple click or unintentional click).
+      if (actual_width < 1 || end_x - start_x <= 5) {
+        return;
+      }
+
+      // Total span of time represented between the start and end times.
+      final long duration;
+      final long start = start_datebox.getValue().getTime();
+      {
+        final long end;
+        final Date end_date = end_datebox.getValue();
+        if (end_date != null) {
+          end = end_date.getTime();
+        } else {
+          end = new Date().getTime();
+        }
+        duration = end - start;
+      }
+
+      // Get the start and end positions of the mouse drag operation on the
+      // image as a percentage of the image size.
+      final long start_change = start_x * duration / actual_width;
+      final long end_change = end_x * duration / actual_width;
+
+      start_datebox.setValue(new Date(start + start_change));
+      end_datebox.setValue(new Date(start + end_change));
+      refreshGraph();
+    }
+
+  };
 
   private final class AdjustYRangeCheckOnClick implements ClickHandler {
 

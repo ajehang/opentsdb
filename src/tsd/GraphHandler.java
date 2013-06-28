@@ -104,6 +104,18 @@ final class GraphHandler implements HttpRpc {
   }
 
   public void execute(final TSDB tsdb, final HttpQuery query) {
+    if (!query.hasQueryStringParam("json")
+        && !query.hasQueryStringParam("png")
+        && !query.hasQueryStringParam("ascii")) {
+      String uri = query.request().getUri();
+      if (uri.length() < 4) {  // Shouldn't happen...
+        uri = "/";             // But just in case, redirect.
+      } else {
+        uri = "/#" + uri.substring(3);  // Remove "/q?"
+      }
+      query.redirect(uri);
+      return;
+    }
     try {
       doGraph(tsdb, query);
     } catch (IOException e) {
@@ -290,21 +302,10 @@ final class GraphHandler implements HttpRpc {
           .append('}');
         query.sendReply(buf);
         writeFile(query, basepath + ".json", buf.toString().getBytes());
+      } else if (query.hasQueryStringParam("png")) {
+        query.sendFile(basepath + ".png", max_age);
       } else {
-          if (query.hasQueryStringParam("png")) {
-            query.sendFile(basepath + ".png", max_age);
-          } else {
-            if (nplotted > 0) {
-              query.sendReply(HttpQuery.makePage("TSDB Query", "Your graph is ready",
-                "<img src=\"" + query.request().getUri() + "&amp;png\"/><br/>"
-                + "<small>(" + nplotted + " points plotted in "
-                + query.processingTimeMillis() + "ms)</small>"));
-            } else {
-              query.sendReply(HttpQuery.makePage("TSDB Query", "No results found",
-                "<blockquote><h1>No results</h1>Your query didn't return"
-                + " anything.  Try changing some parameters.</blockquote>"));
-            }
-          }
+        query.internalError(new Exception("Should never be here!"));
       }
 
       // TODO(tsuna): Expire old files from the on-disk cache.
@@ -668,10 +669,10 @@ final class GraphHandler implements HttpRpc {
       params.put("format x", stringify(value));
     }
     if ((value = popParam(querystring, "ylog")) != null) {
-      params.put("logscale", "y");
+      params.put("logscale y", "");
     }
     if ((value = popParam(querystring, "y2log")) != null) {
-      params.put("logscale", "y2");
+      params.put("logscale y2", "");
     }
     if ((value = popParam(querystring, "key")) != null) {
       params.put("key", value);
@@ -684,6 +685,9 @@ final class GraphHandler implements HttpRpc {
     }
     if ((value = popParam(querystring, "fgcolor")) != null) {
       params.put("fgcolor", value);
+    }
+    if ((value = popParam(querystring, "smooth")) != null) {
+      params.put("smooth", value);
     }
     // This must remain after the previous `if' in order to properly override
     // any previous `key' parameter if a `nokey' parameter is given.
